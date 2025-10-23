@@ -19,5 +19,6 @@ Configuration files live in `/config/homegear`, data in `/share/homegear/lib`, a
 
 ## Troubleshooting
 - Ensure SPI is enabled on the host (`dtparam=spi=on` on Raspberry Pi).
+- On newer Raspberry Pi kernels (Bookworm / kernel 6.6+), re-enable the legacy GPIO sysfs interface with `gpio=0-27` or `dtoverlay=gpio-no-irq` in `config.txt`; otherwise the CC1101 interrupt GPIO cannot be exported.
 - When running as the default `homegear` user, the host should expose the SPI device with group `spi` or a similar non-root group. Otherwise set `homegear_user` to `root` as a last resort.
 - Check `/share/homegear/log/homegear.log` for module-specific errors after startup.

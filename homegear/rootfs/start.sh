@@ -31,6 +31,8 @@ MAX_DEVICE="/dev/spidev0.0"
 MAX_CHECKS=5
 MAX_AUTOMANAGE_MARKER="/var/lib/homegear/.max-spidev-automanaged"
 MAX_CONFIG="/etc/homegear/families/max.conf"
+declare -a MAX_CONFIGURED_GPIOS=()
+declare -i MAX_GPIO_VALIDATION_FAILED=0
 
 write_max_module_state() {
 	local desired="$1"
@@ -66,6 +68,9 @@ disable_max_module() {
 
 enable_max_module_if_managed() {
 	[[ -f "${MAX_AUTOMANAGE_MARKER}" ]] || return 1
+	if (( MAX_GPIO_VALIDATION_FAILED )); then
+		return 1
+	fi
 	if write_max_module_state true; then
 		rm -f "${MAX_AUTOMANAGE_MARKER}"
 		return 0
@@ -94,6 +99,92 @@ log_device_listing() {
 		bashio::log.info "${label} (none detected)"
 	fi
 }
+
+collect_max_configured_gpios() {
+	local config="$1"
+	MAX_CONFIGURED_GPIOS=()
+	[[ -f "${config}" ]] || return 0
+	mapfile -t MAX_CONFIGURED_GPIOS < <(
+		awk '
+		BEGIN { in_section = 0 }
+		{
+			line = $0
+			sub(/#.*/, "", line)
+			gsub(/^[ 	]+|[ 	]+$/, "", line)
+			if (line == "")
+				next
+			lower = tolower(line)
+			if (line ~ /^\[.*\]$/) {
+				section = substr(lower, 2, length(lower) - 2)
+				in_section = (index(section, "ti cc1101") > 0)
+				next
+			}
+			if (in_section && match(lower, /^gpio[0-9]+[ 	]*=[ 	]*(-?[0-9]+)/, m)) {
+				val = m[1] + 0
+				if (val >= 0)
+					print val
+			}
+		}
+		' "${config}" | sort -un
+	)
+}
+
+try_export_gpio() {
+	local gpio="$1"
+	local export_path="/sys/class/gpio/export"
+	local unexport_path="/sys/class/gpio/unexport"
+	local err_file err_msg exported=0
+
+	if [[ ! -w "${export_path}" || ! -w "${unexport_path}" ]]; then
+		bashio::log.debug "GPIO sysfs export paths not writable; skipping check for GPIO ${gpio}."
+		return 0
+	fi
+
+	if [[ -d "/sys/class/gpio/gpio${gpio}" ]]; then
+		return 0
+	fi
+
+	err_file="$(mktemp)"
+	if printf '%s' "${gpio}" > "${export_path}" 2>"${err_file}"; then
+		exported=1
+	else
+		err_msg="$(<"${err_file}")"
+	fi
+	rm -f "${err_file}"
+
+	if (( exported )); then
+		printf '%s' "${gpio}" > "${unexport_path}" 2> /dev/null || true
+		return 0
+	fi
+
+	if [[ -n "${err_msg:-}" ]]; then
+		if [[ "${err_msg}" == *"Invalid argument"* ]]; then
+			bashio::log.error "GPIO ${gpio} could not be exported via sysfs (Invalid argument). On recent Raspberry Pi kernels the legacy GPIO sysfs interface must be enabled manually (e.g. add \"gpio=0-27\" or \"dtoverlay=gpio-no-irq\" to config.txt)."
+		else
+			bashio::log.warning "Failed to export GPIO ${gpio}: ${err_msg}"
+		fi
+	fi
+	return 1
+}
+
+validate_max_gpio_access() {
+	local failure=0 gpio
+
+	((${#MAX_CONFIGURED_GPIOS[@]} > 0)) || return 0
+
+	for gpio in "${MAX_CONFIGURED_GPIOS[@]}"; do
+		if ! try_export_gpio "${gpio}"; then
+			failure=1
+		fi
+	done
+
+	if (( failure )); then
+		MAX_GPIO_VALIDATION_FAILED=1
+		bashio::log.warning "Disabling MAX module until GPIO sysfs access is available."
+		disable_max_module
+	fi
+}
+
 
 bashio::log.info "Initializing Homegear as user ${USER}"
 
@@ -171,6 +262,9 @@ else
 fi
 
 rm -f /var/lib/homegear/homegear_updated
+
+collect_max_configured_gpios "${MAX_CONFIG}"
+validate_max_gpio_access
 
 if [[ -d /var/lib/homegear/node-blue/node-red ]]; then
 	bashio::log.info "Preparing Node-BLUE workspace."

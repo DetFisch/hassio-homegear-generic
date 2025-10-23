@@ -28,6 +28,7 @@ Configuration files, state and logs are stored on the persistent Home Assistant 
 - SPI devices (`/dev/spidev*`) and serial ports are detected on start and matching groups are added to the configured Homegear user automatically.
 - If the SPI interface is not writable after five retries, the MAX! module is disabled to avoid endless reconnect loops; once access is restored it is enabled again.
 - Node-BLUE dependencies are refreshed on each boot with `npm install --omit=dev`; warnings about `npm audit` are informational and come from upstream packages.
+- Raspberry Pi kernels from Bookworm onwards disable the legacy GPIO sysfs interface by default; add `gpio=0-27` or `dtoverlay=gpio-no-irq` to `config.txt` so Homegear can export the CC1101 interrupt GPIO.
 
 ## Contributing
 Issues and pull requests are welcome. Please test changes across architectures where possible; GitHub Actions workflows are planned but not yet available for this fork.
