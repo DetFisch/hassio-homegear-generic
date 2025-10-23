@@ -14,6 +14,19 @@ trap _term SIGTERM
 
 USER="$(bashio::config 'homegear_user')"
 
+set_max_module_enabled() {
+	local desired="$1"
+	local config="/etc/homegear/families/max.conf"
+
+	[ -f "$config" ] || return 0
+
+	if grep -Eq '^[[:space:]]*moduleEnabled[[:space:]]*=' "$config"; then
+		sed -i -E "s|^[[:space:]]*moduleEnabled[[:space:]]*=.*|moduleEnabled = ${desired}|" "$config"
+	else
+		echo "moduleEnabled = ${desired}" >> "$config"
+	fi
+}
+
 echo "Initializing homegear as user ${USER}"
 
 mkdir -p /config/homegear \
@@ -155,6 +168,27 @@ done
 
 echo "Adding group root to user ${USER}"
 usermod -a -G "root" "${USER}" # for usb and gpio
+
+MAX_DEVICE="/dev/spidev0.0"
+MAX_CHECKS=5
+if [ -c "$MAX_DEVICE" ]; then
+	echo "Checking access to MAX interface ${MAX_DEVICE}"
+	check=1
+	while [ $check -le $MAX_CHECKS ]; do
+		if su -s /bin/bash "${USER}" -c "test -r '${MAX_DEVICE}'"; then
+			echo "MAX interface accessible for ${USER}"
+			set_max_module_enabled true
+			break
+		fi
+		echo "MAX interface permission denied (attempt ${check}/${MAX_CHECKS})"
+		sleep 2
+		check=$((check + 1))
+	done
+	if [ $check -gt $MAX_CHECKS ]; then
+		echo "Disabling MAX module after ${MAX_CHECKS} failed attempts"
+		set_max_module_enabled false
+	fi
+fi
 
 echo "Starting Homegear (/usr/bin/homegear -u ${USER} -g ${USER})"
 
