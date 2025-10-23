@@ -121,20 +121,28 @@ printf "\nAttached ttyUSB devices:\n%s\n" "$(ls -al /dev/ttyUSB* 2> /dev/null)"
 printf "Attached ttyAMA devices:\n%s\n" "$(ls -al /dev/ttyAMA* 2> /dev/null)"
 printf "Attached spidev devices:\n%s\n" "$(ls -al /dev/spidev* 2> /dev/null)"
 
-# Add user to the group of all /dev/ttyUSB and /devttyAMA devices so that they are usable
+# Add user to the group of all /dev/ttyUSB, /dev/ttyAMA and /dev/spidev devices so that they are usable
 echo "Adding group of the devices to homegear user ${USER}"
 DEVICE_GROUPS=$({ stat -c '%g' /dev/ttyUSB* 2> /dev/null || : ; stat -c '%g' /dev/ttyAMA* 2> /dev/null || : ; stat -c '%g' /dev/spidev* 2> /dev/null || : ; } | sort | uniq)
 echo "${DEVICE_GROUPS}" | while read -r line ; do
     echo "Found group id: ${line}"
 	if [ -n "${line}" ]
 	then
+	    if [ "${line}" = "0" ]; then
+			echo "Skipping root group - already added below."
+			continue
+		fi
+
 	    echo "Detecting group name"
-		GROUP_NAME=$(id -gn "${line}" 2> /dev/null || true)
-		echo "Group name is: ${GROUP_NAME}"
+		GROUP_NAME=$(getent group "${line}" | cut -d: -f1 || true)
+		if [ -n "${GROUP_NAME}" ]; then
+			echo "Group name is: ${GROUP_NAME}"
+		else
+			echo "Group name not found for gid ${line}"
+		fi
 
 		# Create a dummy group with id of device if none exists
-		if [ -z "${GROUP_NAME}" ]
-		then
+		if [ -z "${GROUP_NAME}" ]; then
 			echo "Group for id ${line} does not exist. Creating one."
 			GROUP_NAME="${USER}-${line}"
 			groupadd -g "${line}" "${GROUP_NAME}"
