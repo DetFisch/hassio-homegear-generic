@@ -1,9 +1,9 @@
 {
   "name": "Homegear",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "slug": "hassio-homegear-generic",
   "description": "Homegear add-on",
-  "url": "https://github.com/devRoemer/hassio-homegear-generic",
+  "url": "https://github.com/DetFisch/hassio-homegear-generic",
   "arch": ["aarch64", "amd64", "armhf", "armv7"],
   "startup": "services",
   "apparmor": false,
