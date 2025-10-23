@@ -307,7 +307,15 @@ fi
 bashio::log.info "Starting Homegear (/usr/bin/homegear -u ${USER} -g ${USER})"
 
 # Set permissions on interfaces and directories, export GPIOs.
-/usr/bin/homegear -u "${USER}" -g "${USER}" -p /var/run/homegear/homegear.pid -pre >> /dev/null 2>&1
+if [[ "${USER}" == "root" ]]; then
+	if ! /usr/bin/homegear -u "${USER}" -g "${USER}" -p /var/run/homegear/homegear.pid -pre >> /dev/null 2>&1; then
+		bashio::log.warning "Homegear pre-start hook failed; GPIO setup may be incomplete."
+	fi
+else
+	if ! /usr/bin/homegear -pre >> /dev/null 2>&1; then
+		bashio::log.warning "Homegear pre-start hook failed; GPIO setup may be incomplete."
+	fi
+fi
 
 /usr/bin/homegear -u "${USER}" -g "${USER}" -p /var/run/homegear/homegear.pid &
 sleep 5
