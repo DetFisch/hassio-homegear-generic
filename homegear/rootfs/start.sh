@@ -33,6 +33,7 @@ MAX_AUTOMANAGE_MARKER="/var/lib/homegear/.max-spidev-automanaged"
 MAX_CONFIG="/etc/homegear/families/max.conf"
 declare -a MAX_CONFIGURED_GPIOS=()
 declare -i MAX_GPIO_VALIDATION_FAILED=0
+declare -i MAX_GPIO_OVERLAY_HINT_PRINTED=0
 
 write_max_module_state() {
 	local desired="$1"
@@ -104,29 +105,37 @@ collect_max_configured_gpios() {
 	local config="$1"
 	MAX_CONFIGURED_GPIOS=()
 	[[ -f "${config}" ]] || return 0
-	mapfile -t MAX_CONFIGURED_GPIOS < <(
-		awk '
-		BEGIN { in_section = 0 }
-		{
-			line = $0
-			sub(/#.*/, "", line)
-			gsub(/^[ 	]+|[ 	]+$/, "", line)
-			if (line == "")
-				next
-			lower = tolower(line)
-			if (line ~ /^\[.*\]$/) {
-				section = substr(lower, 2, length(lower) - 2)
-				in_section = (index(section, "ti cc1101") > 0)
-				next
-			}
-			if (in_section && match(lower, /^gpio[0-9]+[ 	]*=[ 	]*(-?[0-9]+)/, m)) {
-				val = m[1] + 0
-				if (val >= 0)
-					print val
-			}
-		}
-		' "${config}" | sort -un
-	)
+	local line stripped lower key value
+	local in_section=0
+	while IFS= read -r line || [[ -n "${line}" ]]; do
+		stripped="${line%%#*}"
+		stripped="${stripped#"${stripped%%[!$' 	']*}"}"
+		stripped="${stripped%"${stripped##*[!$' 	']}"}"
+		[[ -n "${stripped}" ]] || continue
+		lower="${stripped,,}"
+		if [[ "${lower}" == \[*\] ]]; then
+			if [[ "${lower}" == *"ti cc1101 module"* ]]; then
+				in_section=1
+			else
+				in_section=0
+			fi
+			continue
+		fi
+		if (( in_section )); then
+			key="${lower%%=*}"
+			key="${key#"${key%%[!$' 	']*}"}"
+			key="${key%"${key##*[!$' 	']}"}"
+			value="${lower#*=}"
+			value="${value#"${value%%[!$' 	']*}"}"
+			value="${value%"${value##*[!$' 	']}"}"
+			if [[ "${key}" =~ ^gpio[0-9]+$ && "${value}" =~ ^[0-9]+$ ]]; then
+				MAX_CONFIGURED_GPIOS+=("${value}")
+			fi
+		fi
+	done < "${config}"
+	if ((${#MAX_CONFIGURED_GPIOS[@]} > 0)); then
+		mapfile -t MAX_CONFIGURED_GPIOS < <(printf '%s\n' "${MAX_CONFIGURED_GPIOS[@]}" | sort -un)
+	fi
 }
 
 try_export_gpio() {
@@ -160,6 +169,16 @@ try_export_gpio() {
 	if [[ -n "${err_msg:-}" ]]; then
 		if [[ "${err_msg}" == *"Invalid argument"* ]]; then
 			bashio::log.error "GPIO ${gpio} could not be exported via sysfs (Invalid argument). On recent Raspberry Pi kernels the legacy GPIO sysfs interface must be enabled manually (e.g. add \"gpio=0-27\" or \"dtoverlay=gpio-no-irq\" to config.txt)."
+			if (( MAX_GPIO_OVERLAY_HINT_PRINTED == 0 )); then
+				if [[ -d /proc/device-tree/overlays ]]; then
+					if [[ ! -d /proc/device-tree/overlays/gpio-no-irq ]]; then
+						bashio::log.warning "GPIO overlay \"gpio-no-irq\" not detected on the host. Please ensure dtoverlay=gpio-no-irq is active in config.txt."
+					fi
+				else
+					bashio::log.debug "Device-tree overlay information not available; skipping overlay presence check."
+				fi
+				MAX_GPIO_OVERLAY_HINT_PRINTED=1
+			fi
 		else
 			bashio::log.warning "Failed to export GPIO ${gpio}: ${err_msg}"
 		fi
