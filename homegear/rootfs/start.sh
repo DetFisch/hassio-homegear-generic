@@ -35,6 +35,23 @@ declare -a MAX_CONFIGURED_GPIOS=()
 declare -i MAX_GPIO_VALIDATION_FAILED=0
 declare -i MAX_GPIO_OVERLAY_HINT_PRINTED=0
 
+gpio_overlay_present() {
+	local dir
+	local tree_seen=1
+	for dir in /proc/device-tree/overlays /proc/device-tree/__overlays__ /sys/firmware/devicetree/base/overlays /sys/firmware/devicetree/base/__overlays__; do
+		if [[ -d "${dir}" ]]; then
+			tree_seen=0
+			if compgen -G "${dir}/gpio-no-irq*" > /dev/null; then
+				return 0
+			fi
+		fi
+	done
+	if (( tree_seen == 0 )); then
+		return 1
+	fi
+	return 2
+}
+
 write_max_module_state() {
 	local desired="$1"
 	[[ -f "${MAX_CONFIG}" ]] || return 1
@@ -170,12 +187,17 @@ try_export_gpio() {
 		if [[ "${err_msg}" == *"Invalid argument"* ]]; then
 			bashio::log.error "GPIO ${gpio} could not be exported via sysfs (Invalid argument). On recent Raspberry Pi kernels the legacy GPIO sysfs interface must be enabled manually (e.g. add \"gpio=0-27\" or \"dtoverlay=gpio-no-irq\" to config.txt)."
 			if (( MAX_GPIO_OVERLAY_HINT_PRINTED == 0 )); then
-				if [[ -d /proc/device-tree/overlays ]]; then
-					if [[ ! -d /proc/device-tree/overlays/gpio-no-irq ]]; then
-						bashio::log.warning "GPIO overlay \"gpio-no-irq\" not detected on the host. Please ensure dtoverlay=gpio-no-irq is active in config.txt."
-					fi
+				if gpio_overlay_present; then
+					: # overlay detected
 				else
-					bashio::log.debug "Device-tree overlay information not available; skipping overlay presence check."
+					case $? in
+						1)
+							bashio::log.warning "GPIO overlay \"gpio-no-irq\" not detected on the host. Please ensure dtoverlay=gpio-no-irq is active in config.txt."
+							;;
+						*)
+							bashio::log.debug "Device-tree overlay information not available; skipping overlay presence check."
+							;;
+					esac
 				fi
 				MAX_GPIO_OVERLAY_HINT_PRINTED=1
 			fi

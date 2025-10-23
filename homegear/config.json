@@ -1,6 +1,6 @@
 {
   "name": "Homegear",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "slug": "hassio-homegear-generic",
   "description": "Homegear automation hub (Debian Bookworm / Homegear 0.9)",
   "url": "https://github.com/DetFisch/hassio-homegear-generic",
