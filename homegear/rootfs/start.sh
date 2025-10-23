@@ -1,40 +1,108 @@
 #!/usr/bin/env bashio
+set -Eeuo pipefail
 
 _term() {
-	HOMEGEAR_PID="$(cat /var/run/homegear/homegear.pid)"
-	kill "$(cat /var/run/homegear/homegear-management.pid)"
-	kill "$(cat /var/run/homegear/homegear-influxdb.pid)"
-	kill "$HOMEGEAR_PID"
-	wait "$HOMEGEAR_PID"
-	/etc/homegear/homegear-stop.sh
+	local pid_file
+	for pid_file in \
+		/var/run/homegear/homegear-management.pid \
+		/var/run/homegear/homegear-influxdb.pid \
+		/var/run/homegear/homegear.pid; do
+		if [[ -f "${pid_file}" ]]; then
+			if pid="$(cat "${pid_file}")"; then
+				kill "${pid}" 2>/dev/null || true
+				wait "${pid}" 2>/dev/null || true
+			fi
+		fi
+	done
+	if [[ -x /etc/homegear/homegear-stop.sh ]]; then
+		/etc/homegear/homegear-stop.sh || true
+	fi
 	exit 0
 }
 
-trap _term SIGTERM
+trap _term SIGTERM SIGINT
 
 USER="$(bashio::config 'homegear_user')"
+if ! PRIMARY_GROUP="$(id -gn "${USER}")"; then
+	bashio::log.warning "Unable to determine primary group for ${USER}, falling back to user name."
+	PRIMARY_GROUP="${USER}"
+fi
+MAX_DEVICE="/dev/spidev0.0"
+MAX_CHECKS=5
+MAX_AUTOMANAGE_MARKER="/var/lib/homegear/.max-spidev-automanaged"
+MAX_CONFIG="/etc/homegear/families/max.conf"
 
-set_max_module_enabled() {
+write_max_module_state() {
 	local desired="$1"
-	local config="/etc/homegear/families/max.conf"
-
-	[ -f "$config" ] || return 0
-
-	if grep -Eq '^[[:space:]]*moduleEnabled[[:space:]]*=' "$config"; then
-		sed -i -E "s|^[[:space:]]*moduleEnabled[[:space:]]*=.*|moduleEnabled = ${desired}|" "$config"
+	[[ -f "${MAX_CONFIG}" ]] || return 1
+	if grep -Eq '^[[:space:]]*moduleEnabled[[:space:]]*=' "${MAX_CONFIG}"; then
+		sed -i -E "s|^[[:space:]]*moduleEnabled[[:space:]]*=.*|moduleEnabled = ${desired}|" "${MAX_CONFIG}"
 	else
-		echo "moduleEnabled = ${desired}" >> "$config"
+		printf '\nmoduleEnabled = %s\n' "${desired}" >> "${MAX_CONFIG}"
+	fi
+	return 0
+}
+
+current_max_module_state() {
+	[[ -f "${MAX_CONFIG}" ]] || return 1
+	local value
+	value="$(grep -E '^[[:space:]]*moduleEnabled[[:space:]]*=' "${MAX_CONFIG}" | tail -n1 | awk -F= '{print $2}' | tr -d '[:space:]')" || true
+	[[ -n "${value}" ]] || return 1
+	printf '%s\n' "${value}"
+	return 0
+}
+
+disable_max_module() {
+	local current_state
+	current_state="$(current_max_module_state || true)"
+	if [[ "${current_state}" != "false" ]]; then
+		if write_max_module_state false; then
+			touch "${MAX_AUTOMANAGE_MARKER}"
+		fi
+	else
+		rm -f "${MAX_AUTOMANAGE_MARKER}"
 	fi
 }
 
-echo "Initializing homegear as user ${USER}"
+enable_max_module_if_managed() {
+	[[ -f "${MAX_AUTOMANAGE_MARKER}" ]] || return 1
+	if write_max_module_state true; then
+		rm -f "${MAX_AUTOMANAGE_MARKER}"
+		return 0
+	fi
+	return 1
+}
+
+user_can_access_device() {
+	local device="$1"
+	if [[ "${USER}" == "root" ]]; then
+		[[ -r "${device}" && -w "${device}" ]]
+	else
+		su -s /bin/bash "${USER}" -c "test -r '${device}' && test -w '${device}'"
+	fi
+}
+
+log_device_listing() {
+	local label="$1"
+	local pattern="$2"
+	local output
+	output="$(ls -al ${pattern} 2> /dev/null || true)"
+	if [[ -n "${output}" ]]; then
+		bashio::log.info "${label}"
+		printf '%s\n' "${output}"
+	else
+		bashio::log.info "${label} (none detected)"
+	fi
+}
+
+bashio::log.info "Initializing Homegear as user ${USER}"
 
 mkdir -p /config/homegear \
 	/share/homegear/lib \
 	/share/homegear/log \
 	/usr/share/homegear/firmware
 
-chown homegear:homegear /config/homegear \
+chown "${USER}:${PRIMARY_GROUP}" /config/homegear \
 	/share/homegear/lib \
 	/share/homegear/log
 
@@ -46,50 +114,80 @@ ln -nfs /config/homegear     /etc/homegear
 ln -nfs /share/homegear/lib /var/lib/homegear
 ln -nfs /share/homegear/log /var/log/homegear
 
-if ! [ "$(ls -A /etc/homegear)" ]; then
-	cp -a /etc/homegear.config/* /etc/homegear/
+if [[ -z "$(ls -A /etc/homegear 2> /dev/null)" ]]; then
+	bashio::log.info "Copying default Homegear configuration."
+	cp -a /etc/homegear.config/. /etc/homegear/
 else
-	cp -a /etc/homegear.config/devices/* /etc/homegear/devices/
+	if compgen -G "/etc/homegear.config/devices/*" > /dev/null; then
+		bashio::log.info "Refreshing default device definitions."
+		cp -a /etc/homegear.config/devices/. /etc/homegear/devices/
+	fi
 fi
 
-if test ! -e /etc/homegear/nodeBlueCredentialKey.txt; then
-        tr -dc A-Za-z0-9 < /dev/urandom | head -c 43 > /etc/homegear/nodeBlueCredentialKey.txt
-        chmod 400 /etc/homegear/nodeBlueCredentialKey.txt
+if [[ ! -e /etc/homegear/nodeBlueCredentialKey.txt ]]; then
+	bashio::log.info "Generating Node-BLUE credential key."
+	tr -dc A-Za-z0-9 < /dev/urandom | head -c 43 > /etc/homegear/nodeBlueCredentialKey.txt
+	chmod 400 /etc/homegear/nodeBlueCredentialKey.txt
 fi
 
-if ! [ "$(ls -A /var/lib/homegear)" ]; then
-	cp -a /var/lib/homegear.data/* /var/lib/homegear/
+if [[ -z "$(ls -A /var/lib/homegear 2> /dev/null)" ]]; then
+	bashio::log.info "Initialising Homegear data directory."
+	cp -a /var/lib/homegear.data/. /var/lib/homegear/
 else
+	bashio::log.info "Refreshing Homegear module assets."
 	rm -Rf /var/lib/homegear/modules/*
 	mkdir -p /var/lib/homegear.data/modules
-	cp -a /var/lib/homegear.data/modules/* /var/lib/homegear/modules/ || echo "Could not copy modules to \"homegear.data/modules/\". Please check the permissions on this directory and make sure it is writeable."
+	if compgen -G "/var/lib/homegear.data/modules/*" > /dev/null; then
+		cp -a /var/lib/homegear.data/modules/. /var/lib/homegear/modules/ || bashio::log.warning 'Could not copy modules to "homegear.data/modules/". Please verify directory permissions.'
+	fi
 
 	rm -Rf /var/lib/homegear/flows/nodes/*
 	mkdir -p /var/lib/homegear.data/node-blue/nodes
-	cp -a /var/lib/homegear.data/node-blue/nodes/* /var/lib/homegear/node-blue/nodes/ || echo "Could not copy nodes to \"homegear.data/node-blue/nodes\". Please check the permissions on this directory and make sure it is writeable."
+	if compgen -G "/var/lib/homegear.data/node-blue/nodes/*" > /dev/null; then
+		cp -a /var/lib/homegear.data/node-blue/nodes/. /var/lib/homegear/node-blue/nodes/ || bashio::log.warning 'Could not copy nodes to "homegear.data/node-blue/nodes". Please verify directory permissions.'
+	fi
 
 	rm -Rf /var/lib/homegear/node-blue/www
-	cp -a /var/lib/homegear.data/node-blue/www /var/lib/homegear/node-blue/ || echo "Could not copy Node-BLUE frontend to \"homegear.data/node-blue/www\". Please check the permissions on this directory and make sure it is writeable."
+	if [[ -d /var/lib/homegear.data/node-blue/www ]]; then
+		cp -a /var/lib/homegear.data/node-blue/www /var/lib/homegear/node-blue/ || bashio::log.warning 'Could not copy Node-BLUE frontend to "homegear.data/node-blue/www". Please verify directory permissions.'
+	fi
 
-	cd /var/lib/homegear/admin-ui || echo "Directory /var/lib/homegear/admin-ui not found."
-	# shellcheck disable=SC2010
-	ls /var/lib/homegear/admin-ui/ | grep -v translations  | xargs rm -Rf
-	mkdir -p /var/lib/homegear.data/admin-ui
-	cp -a /var/lib/homegear.data/admin-ui/* /var/lib/homegear/admin-ui/
-	[ ! -f /var/lib/homegear/admin-ui/.env ] && cp -a /var/lib/homegear.data/admin-ui/.env /var/lib/homegear/admin-ui/
-	cp -a /var/lib/homegear.data/admin-ui/.version /var/lib/homegear/admin-ui/ || echo "Could not copy admin UI to \"homegear.data/admin-ui\". Please check the permissions on this directory and make sure it is writeable."
-
+	if [[ -d /var/lib/homegear/admin-ui ]]; then
+		bashio::log.info "Refreshing Admin UI static files."
+		find /var/lib/homegear/admin-ui -mindepth 1 -maxdepth 1 ! -name translations -exec rm -Rf {} +
+		mkdir -p /var/lib/homegear.data/admin-ui
+		if compgen -G "/var/lib/homegear.data/admin-ui/*" > /dev/null; then
+			cp -a /var/lib/homegear.data/admin-ui/. /var/lib/homegear/admin-ui/ || bashio::log.warning 'Could not copy admin UI to "homegear.data/admin-ui". Please verify directory permissions.'
+		fi
+		if [[ ! -f /var/lib/homegear/admin-ui/.env && -f /var/lib/homegear.data/admin-ui/.env ]]; then
+			cp -a /var/lib/homegear.data/admin-ui/.env /var/lib/homegear/admin-ui/
+		fi
+		if [[ -f /var/lib/homegear.data/admin-ui/.version ]]; then
+			cp -a /var/lib/homegear.data/admin-ui/.version /var/lib/homegear/admin-ui/ || bashio::log.warning 'Could not copy admin UI version to "homegear.data/admin-ui". Please verify directory permissions.'
+		fi
+	else
+		bashio::log.warning "Directory /var/lib/homegear/admin-ui not found."
+	fi
 fi
 
 rm -f /var/lib/homegear/homegear_updated
 
 if [[ -d /var/lib/homegear/node-blue/node-red ]]; then
-    echo "Preparing NodeBlue"
-	cd /var/lib/homegear/node-blue/node-red  || echo "Directory /var/lib/homegear/node-blue/node-red not found."
-	npm install
+	bashio::log.info "Preparing Node-BLUE workspace."
+	pushd /var/lib/homegear/node-blue/node-red > /dev/null || bashio::log.warning "Directory /var/lib/homegear/node-blue/node-red not found."
+	if [[ "${PWD}" == "/var/lib/homegear/node-blue/node-red" ]]; then
+		if ! npm install --omit=dev --no-audit --prefer-offline; then
+			bashio::log.warning "npm install (--prefer-offline) failed for Node-BLUE, retrying without cache hint."
+			if ! npm install --omit=dev --no-audit; then
+				bashio::log.warning "npm install failed for Node-BLUE. Please inspect the logs above."
+			fi
+		fi
+		popd > /dev/null || true
+	fi
 fi
 
-if ! [ -f /var/log/homegear/homegear.log ]; then
+if [[ ! -f /var/log/homegear/homegear.log ]]; then
+	bashio::log.info "Creating initial Homegear log files."
 	touch /var/log/homegear/homegear.log
 	touch /var/log/homegear/homegear-flows.log
 	touch /var/log/homegear/homegear-scriptengine.log
@@ -97,25 +195,27 @@ if ! [ -f /var/log/homegear/homegear.log ]; then
 	touch /var/log/homegear/homegear-influxdb.log
 fi
 
-if ! [ -f /etc/homegear/dh1024.pem ]; then
-	echo "Generating homegear certificates"
+if [[ ! -f /etc/homegear/dh1024.pem ]]; then
+	bashio::log.info "Generating Homegear certificates."
 	openssl genrsa -out /etc/homegear/homegear.key 2048
 	openssl req -batch -new -key /etc/homegear/homegear.key -out /etc/homegear/homegear.csr
 	openssl x509 -req -in /etc/homegear/homegear.csr -signkey /etc/homegear/homegear.key -out /etc/homegear/homegear.crt
 	rm /etc/homegear/homegear.csr
-	chown homegear:homegear /etc/homegear/homegear.key
+	chown "${USER}:${PRIMARY_GROUP}" /etc/homegear/homegear.key
 	chmod 400 /etc/homegear/homegear.key
 	openssl dhparam -check -text -5 -out /etc/homegear/dh1024.pem 1024
-	chown homegear:homegear /etc/homegear/dh1024.pem
+	chown "${USER}:${PRIMARY_GROUP}" /etc/homegear/dh1024.pem
 	chmod 400 /etc/homegear/dh1024.pem
 fi
 
 chown -R root:root /etc/homegear
-chown "${USER}":"${USER}" /etc/homegear/*.key
-chown "${USER}":"${USER}" /etc/homegear/*.pem
-chown "${USER}":"${USER}" /etc/homegear/nodeBlueCredentialKey.txt
+find /etc/homegear -maxdepth 1 -type f -name '*.key' -exec chown "${USER}:${PRIMARY_GROUP}" {} +
+find /etc/homegear -maxdepth 1 -type f -name '*.pem' -exec chown "${USER}:${PRIMARY_GROUP}" {} +
+if [[ -f /etc/homegear/nodeBlueCredentialKey.txt ]]; then
+	chown "${USER}:${PRIMARY_GROUP}" /etc/homegear/nodeBlueCredentialKey.txt
+fi
 find /etc/homegear -type d -exec chmod 755 {} \;
-chown -R "${USER}":"${USER}" /var/log/homegear /var/lib/homegear
+chown -R "${USER}:${PRIMARY_GROUP}" /var/log/homegear /var/lib/homegear
 find /var/log/homegear -type d -exec chmod 750 {} \;
 find /var/log/homegear -type f -exec chmod 640 {} \;
 find /var/lib/homegear -type d -exec chmod 750 {} \;
@@ -128,69 +228,83 @@ if [[ -n $TZ ]]; then
 fi
 
 mkdir -p /var/run/homegear
-chown "${USER}":"${USER}" /var/run/homegear
+chown "${USER}:${PRIMARY_GROUP}" /var/run/homegear
 
-printf "\nAttached ttyUSB devices:\n%s\n" "$(ls -al /dev/ttyUSB* 2> /dev/null)"
-printf "Attached ttyAMA devices:\n%s\n" "$(ls -al /dev/ttyAMA* 2> /dev/null)"
-printf "Attached spidev devices:\n%s\n" "$(ls -al /dev/spidev* 2> /dev/null)"
+log_device_listing "Attached ttyUSB devices:" "/dev/ttyUSB*"
+log_device_listing "Attached ttyAMA devices:" "/dev/ttyAMA*"
+log_device_listing "Attached spidev devices:" "/dev/spidev*"
 
 # Add user to the group of all /dev/ttyUSB, /dev/ttyAMA and /dev/spidev devices so that they are usable
-echo "Adding group of the devices to homegear user ${USER}"
-DEVICE_GROUPS=$({ stat -c '%g' /dev/ttyUSB* 2> /dev/null || : ; stat -c '%g' /dev/ttyAMA* 2> /dev/null || : ; stat -c '%g' /dev/spidev* 2> /dev/null || : ; } | sort | uniq)
-echo "${DEVICE_GROUPS}" | while read -r line ; do
-    echo "Found group id: ${line}"
-	if [ -n "${line}" ]
-	then
-	    if [ "${line}" = "0" ]; then
-			echo "Skipping root group - already added below."
-			continue
-		fi
+if [[ "${USER}" != "root" ]]; then
+	bashio::log.info "Ensuring ${USER} can access detected serial and SPI devices."
+	DEVICE_GROUPS=$({ stat -c '%g' /dev/ttyUSB* 2> /dev/null || : ; stat -c '%g' /dev/ttyAMA* 2> /dev/null || : ; stat -c '%g' /dev/spidev* 2> /dev/null || : ; } | sort -u)
+	if [[ -n "${DEVICE_GROUPS}" ]]; then
+		while read -r line; do
+			[[ -n "${line}" ]] || continue
+			if [[ "${line}" == "0" ]]; then
+				bashio::log.debug "Skipping root group (gid 0); handled separately."
+				continue
+			fi
 
-	    echo "Detecting group name"
-		GROUP_NAME=$(getent group "${line}" | cut -d: -f1 || true)
-		if [ -n "${GROUP_NAME}" ]; then
-			echo "Group name is: ${GROUP_NAME}"
-		else
-			echo "Group name not found for gid ${line}"
-		fi
+			GROUP_NAME="$(getent group "${line}" | cut -d: -f1 || true)"
+			if [[ -z "${GROUP_NAME}" ]]; then
+				GROUP_NAME="${USER}-${line}"
+				if groupadd -g "${line}" "${GROUP_NAME}" 2> /dev/null; then
+					bashio::log.info "Created helper group ${GROUP_NAME} (gid ${line})."
+				else
+					GROUP_NAME="$(getent group "${line}" | cut -d: -f1 || true)"
+					if [[ -z "${GROUP_NAME}" ]]; then
+						bashio::log.warning "Failed to create helper group for gid ${line}; skipping."
+						continue
+					fi
+				fi
+			else
+				bashio::log.debug "Found existing group ${GROUP_NAME} for gid ${line}."
+			fi
 
-		# Create a dummy group with id of device if none exists
-		if [ -z "${GROUP_NAME}" ]; then
-			echo "Group for id ${line} does not exist. Creating one."
-			GROUP_NAME="${USER}-${line}"
-			groupadd -g "${line}" "${GROUP_NAME}"
-		fi
-
-		echo "Adding group ${GROUP_NAME} to user ${USER}"
-		usermod -a -G "${GROUP_NAME}" "${USER}"
+			if usermod -a -G "${GROUP_NAME}" "${USER}"; then
+				bashio::log.info "Added ${USER} to group ${GROUP_NAME}."
+			else
+				bashio::log.warning "Failed to add ${USER} to group ${GROUP_NAME}."
+			fi
+		done <<< "${DEVICE_GROUPS}"
+	else
+		bashio::log.info "No additional serial or SPI groups detected."
 	fi
-done
 
-echo "Adding group root to user ${USER}"
-usermod -a -G "root" "${USER}" # for usb and gpio
-
-MAX_DEVICE="/dev/spidev0.0"
-MAX_CHECKS=5
-if [ -c "$MAX_DEVICE" ]; then
-	echo "Checking access to MAX interface ${MAX_DEVICE}"
-	check=1
-	while [ $check -le $MAX_CHECKS ]; do
-		if su -s /bin/bash "${USER}" -c "test -r '${MAX_DEVICE}'"; then
-			echo "MAX interface accessible for ${USER}"
-			set_max_module_enabled true
-			break
-		fi
-		echo "MAX interface permission denied (attempt ${check}/${MAX_CHECKS})"
-		sleep 2
-		check=$((check + 1))
-	done
-	if [ $check -gt $MAX_CHECKS ]; then
-		echo "Disabling MAX module after ${MAX_CHECKS} failed attempts"
-		set_max_module_enabled false
+	if usermod -a -G "root" "${USER}"; then
+		bashio::log.debug "Added ${USER} to group root for GPIO/USB access."
+	else
+		bashio::log.warning "Failed to add ${USER} to group root."
 	fi
+else
+	bashio::log.info "Running as root; skipping supplemental group adjustments."
 fi
 
-echo "Starting Homegear (/usr/bin/homegear -u ${USER} -g ${USER})"
+if [[ -c "${MAX_DEVICE}" ]]; then
+	bashio::log.info "Validating permissions for MAX interface ${MAX_DEVICE}."
+	attempt=1
+	while (( attempt <= MAX_CHECKS )); do
+		if user_can_access_device "${MAX_DEVICE}"; then
+			bashio::log.info "MAX interface accessible for ${USER}."
+			if enable_max_module_if_managed; then
+				bashio::log.info "Re-enabled MAX module after successful permission check."
+			fi
+			break
+		fi
+		bashio::log.warning "MAX interface permission denied (attempt ${attempt}/${MAX_CHECKS})."
+		sleep 2
+		((attempt++))
+	done
+	if (( attempt > MAX_CHECKS )); then
+		bashio::log.warning "Disabling MAX module after ${MAX_CHECKS} failed attempts."
+		disable_max_module
+	fi
+else
+	bashio::log.debug "MAX interface ${MAX_DEVICE} not present."
+fi
+
+bashio::log.info "Starting Homegear (/usr/bin/homegear -u ${USER} -g ${USER})"
 
 # Set permissions on interfaces and directories, export GPIOs.
 /usr/bin/homegear -u "${USER}" -g "${USER}" -p /var/run/homegear/homegear.pid -pre >> /dev/null 2>&1
