@@ -123,7 +123,7 @@ printf "Attached spidev devices:\n%s\n" "$(ls -al /dev/spidev* 2> /dev/null)"
 
 # Add user to the group of all /dev/ttyUSB and /devttyAMA devices so that they are usable
 echo "Adding group of the devices to homegear user ${USER}"
-DEVICE_GROUPS=$({ stat -c '%g' /dev/ttyUSB* 2> /dev/null || : ; stat -c '%g' /dev/ttyAMA* 2> /dev/null || : ; } | sort | uniq)
+DEVICE_GROUPS=$({ stat -c '%g' /dev/ttyUSB* 2> /dev/null || : ; stat -c '%g' /dev/ttyAMA* 2> /dev/null || : ; stat -c '%g' /dev/spidev* 2> /dev/null || : ; } | sort | uniq)
 echo "${DEVICE_GROUPS}" | while read -r line ; do
     echo "Found group id: ${line}"
 	if [ -n "${line}" ]
